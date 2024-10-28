@@ -1,0 +1,127 @@
+#!/usr/bin/env bash
+
+set -euxo pipefail
+
+: "${MACOS_SDK_URL:? "$0: \$MACOS_SDK_URL is not set"}"
+: "${MACOS_SDK_PATH:? "$0: \$MACOS_SDK_PATH is not set"}"
+
+GIT_REPO_URL="https://github.com/tpoechtrager/osxcross"
+COMMIT_HASH="29fe6dd35522073c9df5800f8cd1feb4b9a993a8"
+
+export OSX_VERSION_MIN="10.12"
+export MACOSX_DEPLOYMENT_TARGET="${OSX_VERSION_MIN}"
+export LIBZ_SYS_STATIC="1"
+export OSXCROSS_INSTALL_DIR="/opt/osxcross"
+export OSXCROSS_MP_INC="1"
+export GCC_VERSION="14.2.0"
+export ENABLE_FORTRAN="1"
+export ENABLE_COMPILER_RT_INSTALL="1"
+
+BUILD_DIR=".build"
+OUT_DIR=".out"
+
+NICE="nice -19 ionice -c2 -n5"
+
+function abspath() {
+  readlink -m "$1"
+}
+
+THIS_DIR="$(abspath "$(cd "$(dirname "${BASH_SOURCE[0]}")"; pwd)")"
+ROOT_DIR="$(abspath "${THIS_DIR}/..")"
+
+MACOS_SDK_PATH="$(abspath "${MACOS_SDK_PATH}")"
+if [ ! -f "${MACOS_SDK_PATH}" ]; then
+  mkdir -p "$(dirname "${MACOS_SDK_PATH}")"
+  curl -fsSL -o "${MACOS_SDK_PATH}" "${MACOS_SDK_URL}"
+fi
+
+OPENSSL_TARBALL_PATH="$(abspath "${OPENSSL_TARBALL_PATH}")"
+OPENSSL_DIR="/opt/openssl"
+if [ ! -f "${OPENSSL_TARBALL_PATH}" ]; then
+  mkdir -p "$(dirname "${OPENSSL_TARBALL_PATH}")"
+  curl -fsSL -o "${OPENSSL_TARBALL_PATH}" "${OPENSSL_TARBALL_URL}"
+fi
+
+if [ ! -f "${OPENSSL_DIR}/lib/libssl.a" ]; then
+  mkdir -p "${OPENSSL_DIR}"
+  tar -C "${OPENSSL_DIR}" -xf "${OPENSSL_TARBALL_PATH}"
+  ls -al "${OPENSSL_DIR}"
+fi
+
+commit_short="${COMMIT_HASH:0:7}"
+build_dir="$(abspath ${BUILD_DIR})"
+mkdir -p "${build_dir}"
+outdir="$(abspath "${OUT_DIR}")"
+mkdir -p "${outdir}"
+
+pushd "$build_dir" >/dev/null
+  src_dir="osxcross-${commit_short}"
+
+  if [ ! -d "${src_dir}" ]; then
+    git clone --recursive --depth=100 "${GIT_REPO_URL}" "${src_dir}"
+  fi
+
+  if [ ! -f "${src_dir}/tarballs/$(basename "${MACOS_SDK_PATH}")" ]; then
+    cp "${MACOS_SDK_PATH}" "${src_dir}/tarballs/"
+  fi
+
+  pushd "${src_dir}" >/dev/null
+    git config advice.detachedHead false
+    git checkout "$COMMIT_HASH"
+
+    overlay_dir="${ROOT_DIR}/overlays/osxcross-${commit_short}"
+    if [ -d "${overlay_dir}" ]; then
+      cp -avr "${overlay_dir}" "${build_dir}"
+    fi
+
+    version="$(git show -s --format=%cI HEAD | sed -E 's/[^0-9]+//g' | cut -c 1-12)-${commit_short}-$(date '+%Y%m%d%H%M%S')"
+
+    export CFLAGS="-w -g0 -Os -static-libgcc"
+    export CXXFLAGS="-w -g0 -Os -static-libgcc"
+    export LDFLAGS="-s"
+    export PKG_CONFIG_PATH="${OPENSSL_DIR}/lib/pkgconfig${PKG_CONFIG_PATH:+:PKG_CONFIG_PATH}"
+    export C_INCLUDE_PATH="${OPENSSL_DIR}/include${C_INCLUDE_PATH:+:$C_INCLUDE_PATH}"
+    export CPLUS_INCLUDE_PATH="${OPENSSL_DIR}/include${CPLUS_INCLUDE_PATH:+:$CPLUS_INCLUDE_PATH}"
+    export LIBRARY_PATH="${OPENSSL_DIR}/lib${LIBRARY_PATH:+:$LIBRARY_PATH}"
+
+    export PORTABLE=1
+
+    UNATTENDED=1 \
+    TARGET_DIR="${OSXCROSS_INSTALL_DIR}" \
+    INSTALLPREFIX="${OSXCROSS_INSTALL_DIR}/prefix" \
+    OSX_VERSION_MIN="${OSX_VERSION_MIN}" \
+    PORTABLE="${PORTABLE}" \
+    ${NICE} ./build.sh \
+    | tee -a build.log | stdbuf -oL grep --color=always -iE "error|fail|fail|cannot|can't|unable|$"
+
+    PATH="${OSXCROSS_INSTALL_DIR}/bin${PATH:+":$PATH"}" \
+    GCC_VERSION=${GCC_VERSION} \
+    MY_TARGET_ARCH="x86_64" \
+    ENABLE_FORTRAN=${ENABLE_FORTRAN} \
+    PORTABLE="${PORTABLE}" \
+    ${NICE} ./build_gcc.sh \
+    | tee -a build.log | stdbuf -oL grep --color=always -iE "error|fail|fail|cannot|can't|unable|$"
+
+    PATH="${OSXCROSS_INSTALL_DIR}/bin${PATH:+":$PATH"}" \
+    GCC_VERSION="${GCC_VERSION}" \
+    MY_TARGET_ARCH="aarch64" \
+    ENABLE_FORTRAN=${ENABLE_FORTRAN} \
+    PORTABLE="${PORTABLE}" \
+    ${NICE} ./build_gcc.sh \
+    | tee -a build.log | stdbuf -oL grep --color=always -iE "error|fail|fail|cannot|can't|unable|$"
+
+    pushd "${OSXCROSS_INSTALL_DIR}/bin" >/dev/null
+      ln -fs  "dsymutil" "aarch64-apple-darwin20.2-dsymutil"
+      ln -fs  "dsymutil" "arm64-apple-darwin20.2-dsymutil"
+      ln -fs  "dsymutil" "arm64e-apple-darwin20.2-dsymutil"
+      ln -fs  "dsymutil" "x86_64-apple-darwin20.2-dsymutil"
+      ln -fs  "dsymutil" "x86_64h-apple-darwin20.2-dsymutil"
+    popd >/dev/null
+
+    cp "build.log" "${OSXCROSS_INSTALL_DIR}/"
+
+  popd >/dev/null
+
+  ${NICE} find "${OSXCROSS_INSTALL_DIR}" -printf "%P\n" | tar --no-recursion -cf - -C "${OSXCROSS_INSTALL_DIR}" --files-from=- | xz -T0 -k > "${outdir}/osxcross-${version}.tar.xz"
+
+popd >/dev/null
