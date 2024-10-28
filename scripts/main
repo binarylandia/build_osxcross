@@ -5,8 +5,8 @@ set -euxo pipefail
 : "${MACOS_SDK_URL:? "$0: \$MACOS_SDK_URL is not set"}"
 : "${MACOS_SDK_PATH:? "$0: \$MACOS_SDK_PATH is not set"}"
 
-GIT_REPO_URL="https://github.com/tpoechtrager/osxcross"
-COMMIT_HASH="29fe6dd35522073c9df5800f8cd1feb4b9a993a8"
+GIT_REPO_URL="https://github.com/binarylandia/osxcross"
+COMMIT_HASH="758b9a45406a56fe5962dcb5442a28a26a483c07"
 
 export OSX_VERSION_MIN="10.12"
 export MACOSX_DEPLOYMENT_TARGET="${OSX_VERSION_MIN}"
@@ -68,11 +68,6 @@ pushd "$build_dir" >/dev/null
   pushd "${src_dir}" >/dev/null
     git config advice.detachedHead false
     git checkout "$COMMIT_HASH"
-
-    overlay_dir="${ROOT_DIR}/overlays/osxcross-${commit_short}"
-    if [ -d "${overlay_dir}" ]; then
-      cp -avr "${overlay_dir}" "${build_dir}"
-    fi
 
     version="$(git show -s --format=%cI HEAD | sed -E 's/[^0-9]+//g' | cut -c 1-12)-${commit_short}-$(date '+%Y%m%d%H%M%S')"
 
