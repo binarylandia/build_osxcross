@@ -89,7 +89,6 @@ RUN set -euxo pipefail >/dev/null \
 && ls /usr/lib/libcrypto.a
 
 RUN set -euxo pipefail >/dev/null \
-&& export LD_LIBRARY_PATH="/usr/lib:/usr/lib64:/usr/local/lib:/usr/local/lib64${LD_LIBRARY_PATH:+":${LD_LIBRARY_PATH}"}" \
 && curl -fsSL "https://github.com/binarylandia/build_gcc/releases/download/2024-11-01_15-42-39/gcc-14.2.0-host-x86_64-unknown-linux-gnu.2.17-2024-11-01_15-42-39.tar.xz" | tar -C "/usr" -xJ \
 && ls /usr/bin/gcc \
 && gcc -v \
@@ -97,7 +96,7 @@ RUN set -euxo pipefail >/dev/null \
 && gcc-ar --version
 
 RUN set -euxo pipefail >/dev/null \
-&& curl -fsSL "https://github.com/binarylandia/build_llvm/releases/download/llvm-18.1.8-2024-11-01_06-09-48/llvm-18.1.8-2024-11-01_06-09-48.tar.xz" | tar -C "/usr" -xJ \
+&& curl -fsSL "https://github.com/binarylandia/build_llvm/releases/download/llvm-18.1.8-2024-11-02_06-08-31/llvm-18.1.8-2024-11-02_06-08-31.tar.xz" | tar -C "/usr" -xJ \
 && ls /usr/bin/clang \
 && clang -v
 
