@@ -1,29 +1,92 @@
 #!/usr/bin/env bash
 
+source scl_source enable devtoolset-11
+
 set -euxo pipefail
 
 : "${MACOS_SDK_URL:? "$0: \$MACOS_SDK_URL is not set"}"
 : "${MACOS_SDK_PATH:? "$0: \$MACOS_SDK_PATH is not set"}"
 
 GIT_REPO_URL="https://github.com/binarylandia/osxcross"
-COMMIT_HASH="758b9a45406a56fe5962dcb5442a28a26a483c07"
+COMMIT_HASH="b49804a40a76f54064d062004365b0361db12372"
+
+export BUILD_DIR=".build"
+export OUT_DIR=".out"
+export INSTALL_DIR="/opt/osxcross"
 
 export OSX_VERSION_MIN="10.12"
 export MACOSX_DEPLOYMENT_TARGET="${OSX_VERSION_MIN}"
 export LIBZ_SYS_STATIC="1"
-export OSXCROSS_INSTALL_DIR="/opt/osxcross"
 export OSXCROSS_MP_INC="1"
 export GCC_VERSION="14.2.0"
 export ENABLE_FORTRAN="1"
 export ENABLE_COMPILER_RT_INSTALL="1"
+export PORTABLE=1
+export OCDEBUG=0
+export UNATTENDED=1
+export TARGET_DIR="${INSTALL_DIR}"
+export INSTALLPREFIX="${INSTALL_DIR}"
 
-BUILD_DIR=".build"
-OUT_DIR=".out"
+export CFLAGS="-w -g0 -Os ${CFLAGS:-}"
+export CXXFLAGS="-w -g0 -Os ${CXXFLAGS:-}"
+export LDFLAGS="-s ${LDFLAGS:-}"
 
-NICE="nice -19 ionice -c2 -n5"
+export CFLAGS="-static-libgcc -static-libstdc++ ${CFLAGS:-}"
+export CXXFLAGS="-static-libgcc -static-libstdc++ ${CXXFLAGS:-}"
+export LDFLAGS="-static-libgcc -static-libstdc++ ${LDFLAGS:-}"
+
+#export CFLAGS="-static --static ${CFLAGS:-}"
+#export CXXFLAGS="-static --static ${CXXFLAGS:-}"
+#export LDFLAGS="-static --static ${LDFLAGS:-}"
+
+#export CFLAGS="-fPIC ${CFLAGS:-}"
+#export CXXFLAGS="-fPIC ${CXXFLAGS:-}"
+#export LDFLAGS="-fPIC ${LDFLAGS:-}"
+
+#export CFLAGS="-pie -fPIE ${CFLAGS:-}"
+#export CXXFLAGS="-pie -fPIE ${CXXFLAGS:-}"
+#export LDFLAGS="-pie -fPIE ${LDFLAGS:-}"
+
+#export CC="${CC:-/usr/bin/clang}"
+#export CXX="${CXX:-/usr/bin/clang++}"
+export AR="${AR:-/usr/bin/gcc-ar}"
+export NM="${NM:-/usr/bin/gcc-nm}"
+export RANLIB="${RANLIB:-/usr/bin/gcc-ranlib}"
+
+#export CCACHE_DIR="/cache/ccache"
+#export CCACHE_NOCOMPRESS="1"
+#export CCACHE_MAXSIZE="50G"
+#export CMAKE_C_COMPILER_LAUNCHER="ccache"
+#export CMAKE_CXX_COMPILER_LAUNCHER="ccache"
+
+export LIBRARY_PATH="/usr/lib:/usr/lib64:/usr/local/lib:/usr/local/lib64${LIBRARY_PATH:+":${LIBRARY_PATH}"}"
+export LD_LIBRARY_PATH="/usr/lib:/usr/lib64:/usr/local/lib:/usr/local/lib64${LD_LIBRARY_PATH:+":${LD_LIBRARY_PATH}"}"
+
+export PATH="${INSTALL_DIR}/bin${PATH:+":$PATH"}"
+
+export NICE="nice -19 ionice -c2 -n5"
+export JOBS="${JOBS:=$(($(nproc --all) + 2))}"
+
+export build_time="$(date -u '+%Y-%m-%d_%H-%M-%S')"
 
 function abspath() {
   readlink -m "$1"
+}
+
+function log() {
+  tee -a "${1}" | \
+    GREP_COLOR='01;31' stdbuf -oL grep --color=always -iE "err|error|fail|can not|cannot|can't|unable|exception|critical|fatal|reject|deny|denied|terminat|abort|panic|fault|" | \
+    GREP_COLOR='01;33' stdbuf -oL grep --color=always -iE "warn|warning|caution|alert|notice|" | \
+    GREP_COLOR='01;36' stdbuf -oL grep --color=always -iE "note|info|status|detail|"
+}
+
+function package() {
+  local input_dir="${1}"
+  local output_tarball="${2}"
+
+  ${NICE} find "${input_dir}" -printf "%P\n" \
+    | ${NICE} tar --no-recursion -cf - -C "${input_dir}" --files-from=- \
+    | ${NICE} xz -T0 -k > "${output_tarball}"
 }
 
 THIS_DIR="$(abspath "$(cd "$(dirname "${BASH_SOURCE[0]}")"; pwd)")"
@@ -33,19 +96,6 @@ MACOS_SDK_PATH="$(abspath "${MACOS_SDK_PATH}")"
 if [ ! -f "${MACOS_SDK_PATH}" ]; then
   mkdir -p "$(dirname "${MACOS_SDK_PATH}")"
   curl -fsSL -o "${MACOS_SDK_PATH}" "${MACOS_SDK_URL}"
-fi
-
-OPENSSL_TARBALL_PATH="$(abspath "${OPENSSL_TARBALL_PATH}")"
-OPENSSL_DIR="/opt/openssl"
-if [ ! -f "${OPENSSL_TARBALL_PATH}" ]; then
-  mkdir -p "$(dirname "${OPENSSL_TARBALL_PATH}")"
-  curl -fsSL -o "${OPENSSL_TARBALL_PATH}" "${OPENSSL_TARBALL_URL}"
-fi
-
-if [ ! -f "${OPENSSL_DIR}/lib/libssl.a" ]; then
-  mkdir -p "${OPENSSL_DIR}"
-  tar -C "${OPENSSL_DIR}" -xf "${OPENSSL_TARBALL_PATH}"
-  ls -al "${OPENSSL_DIR}"
 fi
 
 commit_short="${COMMIT_HASH:0:7}"
@@ -71,41 +121,13 @@ pushd "$build_dir" >/dev/null
 
     version="$(git show -s --format=%cI HEAD | sed -E 's/[^0-9]+//g' | cut -c 1-12)-${commit_short}-$(date '+%Y%m%d%H%M%S')"
 
-    export CFLAGS="-w -g0 -Os -static-libgcc"
-    export CXXFLAGS="-w -g0 -Os -static-libgcc"
-    export LDFLAGS="-s"
-    export PKG_CONFIG_PATH="${OPENSSL_DIR}/lib/pkgconfig${PKG_CONFIG_PATH:+:PKG_CONFIG_PATH}"
-    export C_INCLUDE_PATH="${OPENSSL_DIR}/include${C_INCLUDE_PATH:+:$C_INCLUDE_PATH}"
-    export CPLUS_INCLUDE_PATH="${OPENSSL_DIR}/include${CPLUS_INCLUDE_PATH:+:$CPLUS_INCLUDE_PATH}"
-    export LIBRARY_PATH="${OPENSSL_DIR}/lib${LIBRARY_PATH:+:$LIBRARY_PATH}"
+    ${NICE} ./build.sh 2>&1 | log "build.log"
 
-    export PORTABLE=1
+    MY_TARGET_ARCH="x86_64" ${NICE} ./build_gcc.sh 2>&1 | log "build.log"
 
-    UNATTENDED=1 \
-    TARGET_DIR="${OSXCROSS_INSTALL_DIR}" \
-    INSTALLPREFIX="${OSXCROSS_INSTALL_DIR}/prefix" \
-    OSX_VERSION_MIN="${OSX_VERSION_MIN}" \
-    PORTABLE="${PORTABLE}" \
-    ${NICE} ./build.sh \
-    | tee -a build.log | stdbuf -oL grep --color=always -iE "error|fail|fail|cannot|can't|unable|$"
+    MY_TARGET_ARCH="aarch64" ${NICE} ./build_gcc.sh 2>&1 | log "build.log"
 
-    PATH="${OSXCROSS_INSTALL_DIR}/bin${PATH:+":$PATH"}" \
-    GCC_VERSION=${GCC_VERSION} \
-    MY_TARGET_ARCH="x86_64" \
-    ENABLE_FORTRAN=${ENABLE_FORTRAN} \
-    PORTABLE="${PORTABLE}" \
-    ${NICE} ./build_gcc.sh \
-    | tee -a build.log | stdbuf -oL grep --color=always -iE "error|fail|fail|cannot|can't|unable|$"
-
-    PATH="${OSXCROSS_INSTALL_DIR}/bin${PATH:+":$PATH"}" \
-    GCC_VERSION="${GCC_VERSION}" \
-    MY_TARGET_ARCH="aarch64" \
-    ENABLE_FORTRAN=${ENABLE_FORTRAN} \
-    PORTABLE="${PORTABLE}" \
-    ${NICE} ./build_gcc.sh \
-    | tee -a build.log | stdbuf -oL grep --color=always -iE "error|fail|fail|cannot|can't|unable|$"
-
-    pushd "${OSXCROSS_INSTALL_DIR}/bin" >/dev/null
+    pushd "${INSTALL_DIR}/bin" >/dev/null
       ln -fs  "dsymutil" "aarch64-apple-darwin20.2-dsymutil"
       ln -fs  "dsymutil" "arm64-apple-darwin20.2-dsymutil"
       ln -fs  "dsymutil" "arm64e-apple-darwin20.2-dsymutil"
@@ -113,10 +135,18 @@ pushd "$build_dir" >/dev/null
       ln -fs  "dsymutil" "x86_64h-apple-darwin20.2-dsymutil"
     popd >/dev/null
 
-    cp "build.log" "${OSXCROSS_INSTALL_DIR}/"
+    cp "build.log" "${INSTALL_DIR}/"
+
+    "${ROOT_DIR}/scripts/is-static-binary" "${INSTALL_DIR}"/bin/x86_64-apple-darwin20.2-clang || true
+    "${ROOT_DIR}/scripts/is-static-binary" "${INSTALL_DIR}"/bin/x86_64-apple-darwin20.2-gcc || true
+    "${ROOT_DIR}/scripts/is-static-binary" "${INSTALL_DIR}"/bin/x86_64-apple-darwin20.2-gfortran || true
+
+    "${INSTALL_DIR}"/bin/x86_64-apple-darwin20.2-clang -v || true
+    "${INSTALL_DIR}"/bin/x86_64-apple-darwin20.2-gcc -v || true
+    "${INSTALL_DIR}"/bin/x86_64-apple-darwin20.2-gfortran -v || true
 
   popd >/dev/null
 
-  ${NICE} find "${OSXCROSS_INSTALL_DIR}" -printf "%P\n" | tar --no-recursion -cf - -C "${OSXCROSS_INSTALL_DIR}" --files-from=- | xz -T0 -k > "${outdir}/osxcross-${version}.tar.xz"
+  package "${INSTALL_DIR}" "${outdir}/osxcross-${version}-${build_time}.tar.xz"
 
 popd >/dev/null
