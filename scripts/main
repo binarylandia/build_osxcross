@@ -7,25 +7,8 @@ set -euxo pipefail
 : "${MACOS_SDK_URL:? "$0: \$MACOS_SDK_URL is not set"}"
 : "${MACOS_SDK_PATH:? "$0: \$MACOS_SDK_PATH is not set"}"
 
-GIT_REPO_URL="https://github.com/binarylandia/osxcross"
-COMMIT_HASH="b49804a40a76f54064d062004365b0361db12372"
-
 export BUILD_DIR=".build"
 export OUT_DIR=".out"
-export INSTALL_DIR="/opt/osxcross"
-
-export OSX_VERSION_MIN="10.12"
-export MACOSX_DEPLOYMENT_TARGET="${OSX_VERSION_MIN}"
-export LIBZ_SYS_STATIC="1"
-export OSXCROSS_MP_INC="1"
-export GCC_VERSION="14.2.0"
-export ENABLE_FORTRAN="1"
-export ENABLE_COMPILER_RT_INSTALL="1"
-export PORTABLE=1
-export OCDEBUG=0
-export UNATTENDED=1
-export TARGET_DIR="${INSTALL_DIR}"
-export INSTALLPREFIX="${INSTALL_DIR}"
 
 export CFLAGS="-w -g0 -Os ${CFLAGS:-}"
 export CXXFLAGS="-w -g0 -Os ${CXXFLAGS:-}"
@@ -39,8 +22,6 @@ export AR="${AR:-/usr/bin/gcc-ar}"
 export NM="${NM:-/usr/bin/gcc-nm}"
 export RANLIB="${RANLIB:-/usr/bin/gcc-ranlib}"
 
-export PATH="${INSTALL_DIR}/bin${PATH:+":$PATH"}"
-
 export NICE="nice -19 ionice -c2 -n5"
 export JOBS="${JOBS:=$(($(nproc --all) + 2))}"
 
@@ -49,81 +30,120 @@ export build_time="$(date -u '+%Y-%m-%d_%H-%M-%S')"
 function abspath() {
   readlink -m "$1"
 }
+export -f abspath
 
 function log() {
-  tee -a "${1}" | \
-    GREP_COLOR='01;31' stdbuf -oL grep --color=always -iE "err|error|fail|can not|cannot|can't|unable|exception|critical|fatal|reject|deny|denied|terminat|abort|panic|fault|" | \
-    GREP_COLOR='01;33' stdbuf -oL grep --color=always -iE "warn|warning|caution|alert|notice|" | \
+  tee -a "${1}" |
+    GREP_COLOR='01;31' stdbuf -oL grep --color=always -iE "err|error|fail|can not|cannot|can't|unable|exception|critical|fatal|reject|deny|denied|terminat|abort|panic|fault|" |
+    GREP_COLOR='01;33' stdbuf -oL grep --color=always -iE "warn|warning|caution|alert|notice|" |
     GREP_COLOR='01;36' stdbuf -oL grep --color=always -iE "note|info|status|detail|"
 }
+export -f log
 
 function package() {
   local input_dir="${1}"
   local output_tarball="${2}"
 
-  ${NICE} find "${input_dir}" -printf "%P\n" \
-    | ${NICE} tar --no-recursion -cf - -C "${input_dir}" --files-from=- \
-    | ${NICE} xz -T0 -k > "${output_tarball}"
+  ${NICE} find "${input_dir}" -printf "%P\n" |
+    ${NICE} tar --no-recursion -cf - -C "${input_dir}" --files-from=- |
+    ${NICE} xz -T0 -k >"${output_tarball}"
 }
+export -f package
 
-THIS_DIR="$(abspath "$(cd "$(dirname "${BASH_SOURCE[0]}")"; pwd)")"
-ROOT_DIR="$(abspath "${THIS_DIR}/..")"
+export THIS_DIR="$(abspath "$(
+  cd "$(dirname "${BASH_SOURCE[0]}")"
+  pwd
+)")"
 
-MACOS_SDK_PATH="$(abspath "${MACOS_SDK_PATH}")"
+export ROOT_DIR="$(abspath "${THIS_DIR}/..")"
+
+export MACOS_SDK_PATH="$(abspath "${MACOS_SDK_PATH}")"
 if [ ! -f "${MACOS_SDK_PATH}" ]; then
   mkdir -p "$(dirname "${MACOS_SDK_PATH}")"
   curl -fsSL -o "${MACOS_SDK_PATH}" "${MACOS_SDK_URL}"
 fi
 
-commit_short="${COMMIT_HASH:0:7}"
-build_dir="$(abspath ${BUILD_DIR})"
-mkdir -p "${build_dir}"
-outdir="$(abspath "${OUT_DIR}")"
-mkdir -p "${outdir}"
+flavors=(
+  "full"
+  "minimal"
+)
 
-pushd "$build_dir" >/dev/null
-  src_dir="osxcross-${commit_short}"
+function build_and_package() {
+  set -euxo pipefail
 
-  if [ ! -d "${src_dir}" ]; then
-    git clone --recursive --depth=100 "${GIT_REPO_URL}" "${src_dir}"
-  fi
+  local flavor="${1}"
 
-  if [ ! -f "${src_dir}/tarballs/$(basename "${MACOS_SDK_PATH}")" ]; then
-    cp "${MACOS_SDK_PATH}" "${src_dir}/tarballs/"
-  fi
+  case "${flavor}" in
+  full)
+    local GIT_REPO_URL="https://github.com/binarylandia/osxcross"
+    local COMMIT_HASH="b49804a40a76f54064d062004365b0361db12372"
+    ;;
+  minimal)
+    local GIT_REPO_URL="https://github.com/binarylandia/osxcross"
+    local COMMIT_HASH="29fe6dd35522073c9df5800f8cd1feb4b9a993a8"
+    ;;
+  esac
 
-  pushd "${src_dir}" >/dev/null
-    git config advice.detachedHead false
-    git checkout "$COMMIT_HASH"
+  local commit_short="${COMMIT_HASH:0:7}"
 
-    version="$(git show -s --format=%cI HEAD | sed -E 's/[^0-9]+//g' | cut -c 1-12)-${commit_short}-$(date '+%Y%m%d%H%M%S')"
+  local build_dir="$(abspath ${BUILD_DIR})/${flavor}-${commit_short}"
+  local outdir="$(abspath "${OUT_DIR}")"
+  local install_dir="/opt/osxcross/${flavor}-${commit_short}"
+  local src_dir="osxcross-${flavor}-${commit_short}"
+  mkdir -p "${outdir}" "${build_dir}"
 
-    ${NICE} ./build.sh 2>&1 | log "build.log"
+  pushd "${build_dir}" >/dev/null
+  {
+    if [ ! -d "${src_dir}" ]; then
+      git clone --recursive --depth=1 "${GIT_REPO_URL}" "${src_dir}"
+    fi
 
-    MY_TARGET_ARCH="x86_64" ${NICE} ./build_gcc.sh 2>&1 | log "build.log"
+    if [ ! -f "${src_dir}/tarballs/$(basename "${MACOS_SDK_PATH}")" ]; then
+      cp "${MACOS_SDK_PATH}" "${src_dir}/tarballs/"
+    fi
 
-    MY_TARGET_ARCH="aarch64" ${NICE} ./build_gcc.sh 2>&1 | log "build.log"
+    pushd "${src_dir}" >/dev/null
+    {
+      git config advice.detachedHead false
+      git checkout "${COMMIT_HASH}"
 
-    pushd "${INSTALL_DIR}/bin" >/dev/null
-      ln -fs  "dsymutil" "aarch64-apple-darwin20.2-dsymutil"
-      ln -fs  "dsymutil" "arm64-apple-darwin20.2-dsymutil"
-      ln -fs  "dsymutil" "arm64e-apple-darwin20.2-dsymutil"
-      ln -fs  "dsymutil" "x86_64-apple-darwin20.2-dsymutil"
-      ln -fs  "dsymutil" "x86_64h-apple-darwin20.2-dsymutil"
+      declare -x OSX_VERSION_MIN="10.12"
+      declare -x MACOSX_DEPLOYMENT_TARGET="${OSX_VERSION_MIN}"
+      declare -x LIBZ_SYS_STATIC="1"
+      declare -x OSXCROSS_MP_INC="1"
+      declare -x GCC_VERSION="14.2.0"
+      declare -x ENABLE_FORTRAN="1"
+      declare -x ENABLE_COMPILER_RT_INSTALL="1"
+      declare -x PORTABLE=1
+      declare -x OCDEBUG=0
+      declare -x UNATTENDED=1
+      declare -x TARGET_DIR="${install_dir}"
+      declare -x INSTALLPREFIX="${install_dir}"
+
+      export PATH="${install_dir}/bin${PATH:+":$PATH"}"
+
+      ${NICE} ./build.sh 2>&1 | log "build.log"
+
+      if [ "${flavor}" == "full" ]; then
+        MY_TARGET_ARCH="x86_64" ${NICE} ./build_gcc.sh 2>&1 | log "build.log"
+        MY_TARGET_ARCH="aarch64" ${NICE} ./build_gcc.sh 2>&1 | log "build.log"
+      fi
+
+      pushd "${install_dir}/bin" >/dev/null
+      {
+        ln -fs "dsymutil" "aarch64-apple-darwin20.2-dsymutil"
+        ln -fs "dsymutil" "arm64-apple-darwin20.2-dsymutil"
+        ln -fs "dsymutil" "arm64e-apple-darwin20.2-dsymutil"
+        ln -fs "dsymutil" "x86_64-apple-darwin20.2-dsymutil"
+        ln -fs "dsymutil" "x86_64h-apple-darwin20.2-dsymutil"
+      }
+      popd >/dev/null
+    }
     popd >/dev/null
-
-    cp "build.log" "${INSTALL_DIR}/"
-
-    "${ROOT_DIR}/scripts/is-static-binary" "${INSTALL_DIR}"/bin/x86_64-apple-darwin20.2-clang || true
-    "${ROOT_DIR}/scripts/is-static-binary" "${INSTALL_DIR}"/bin/x86_64-apple-darwin20.2-gcc || true
-    "${ROOT_DIR}/scripts/is-static-binary" "${INSTALL_DIR}"/bin/x86_64-apple-darwin20.2-gfortran || true
-
-    "${INSTALL_DIR}"/bin/x86_64-apple-darwin20.2-clang -v || true
-    "${INSTALL_DIR}"/bin/x86_64-apple-darwin20.2-gcc -v || true
-    "${INSTALL_DIR}"/bin/x86_64-apple-darwin20.2-gfortran -v || true
-
+  }
   popd >/dev/null
 
-  package "${INSTALL_DIR}" "${outdir}/osxcross-${version}-${build_time}.tar.xz"
-
-popd >/dev/null
+  package "${install_dir}" "${outdir}/osxcross-${flavor}-${commit_short}-${build_time}.tar.xz"
+}
+export -f build_and_package
+parallel -j5 -u build_and_package ::: "${flavors[@]}"
