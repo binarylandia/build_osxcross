@@ -1,0 +1,19 @@
+#!/usr/bin/env bash
+
+set -euo pipefail
+trap "exit" INT
+
+function abspath() {
+  readlink -m "$1"
+}
+
+export THIS_DIR="$(abspath "$(cd "$(dirname "${BASH_SOURCE[0]}")";  pwd)")"
+
+if [ -z "$1" ]; then
+  echo "Usage: $0 <dir>" >&2
+  exit 1
+fi
+
+find ${1:-} -maxdepth 1 -type f -exec bash -c "\
+  ${THIS_DIR}/is-static-binary '{}' 2>&1; printf '\n\n'" \; \
+  | grep --color=always -P '^(?!.*(?:libdl|libm)\.so).*\.so.*$|'

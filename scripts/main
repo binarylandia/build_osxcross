@@ -1,8 +1,6 @@
 #!/usr/bin/env bash
 
-source scl_source enable devtoolset-11
-
-set -euxo pipefail
+set -euo pipefail
 
 : "${MACOS_SDK_URL:? "$0: \$MACOS_SDK_URL is not set"}"
 : "${MACOS_SDK_PATH:? "$0: \$MACOS_SDK_PATH is not set"}"
@@ -12,15 +10,11 @@ export OUT_DIR=".out"
 
 export CFLAGS="-w -g0 -Os ${CFLAGS:-}"
 export CXXFLAGS="-w -g0 -Os ${CXXFLAGS:-}"
-export LDFLAGS="-s ${LDFLAGS:-}"
+export LDFLAGS="-w -s ${LDFLAGS:-}"
 
 export CFLAGS="-static-libgcc -static-libstdc++ ${CFLAGS:-}"
 export CXXFLAGS="-static-libgcc -static-libstdc++ ${CXXFLAGS:-}"
 export LDFLAGS="-static-libgcc -static-libstdc++ ${LDFLAGS:-}"
-
-export AR="${AR:-/usr/bin/gcc-ar}"
-export NM="${NM:-/usr/bin/gcc-nm}"
-export RANLIB="${RANLIB:-/usr/bin/gcc-ranlib}"
 
 export NICE="nice -19 ionice -c2 -n5"
 export JOBS="${JOBS:=$(($(nproc --all) + 2))}"
@@ -50,11 +44,7 @@ function package() {
 }
 export -f package
 
-export THIS_DIR="$(abspath "$(
-  cd "$(dirname "${BASH_SOURCE[0]}")"
-  pwd
-)")"
-
+export THIS_DIR="$(abspath "$(cd "$(dirname "${BASH_SOURCE[0]}")"; pwd)")"
 export ROOT_DIR="$(abspath "${THIS_DIR}/..")"
 
 export MACOS_SDK_PATH="$(abspath "${MACOS_SDK_PATH}")"
@@ -63,9 +53,15 @@ if [ ! -f "${MACOS_SDK_PATH}" ]; then
   curl -fsSL -o "${MACOS_SDK_PATH}" "${MACOS_SDK_URL}"
 fi
 
+export CCACHE_DIR="${ROOT_DIR}/.cache/ccache"
+export CCACHE_NOCOMPRESS="1"
+export CCACHE_MAXSIZE="50G"
+
+export CMAKE_C_COMPILER_LAUNCHER="ccache"
+export CMAKE_CXX_COMPILER_LAUNCHER="ccache"
+
 flavors=(
   "full"
-  "minimal"
 )
 
 function build_and_package() {
@@ -76,7 +72,7 @@ function build_and_package() {
   case "${flavor}" in
   full)
     local GIT_REPO_URL="https://github.com/binarylandia/osxcross"
-    local COMMIT_HASH="b49804a40a76f54064d062004365b0361db12372"
+    local COMMIT_HASH="41f3856bae6e62bc44a2141c7977c63f87167809"
     ;;
   minimal)
     local GIT_REPO_URL="https://github.com/binarylandia/osxcross"
@@ -122,10 +118,14 @@ function build_and_package() {
 
       export PATH="${install_dir}/bin${PATH:+":$PATH"}"
 
+      export CC="ccache ${CLANG} ${CFLAGS}"
+      export CXX="ccache ${CLANGXX} ${CXXFLAGS}"
       ${NICE} ./build.sh 2>&1 | log "build.log"
 
       if [ "${flavor}" == "full" ]; then
-        MY_TARGET_ARCH="x86_64" ${NICE} ./build_gcc.sh 2>&1 | log "build.log"
+        export CC="ccache ${GCC} ${CFLAGS}"
+        export CXX="ccache ${GXX} ${CXXFLAGS}"
+        MY_TARGET_ARCH="x86_64"  ${NICE} ./build_gcc.sh 2>&1 | log "build.log"
         MY_TARGET_ARCH="aarch64" ${NICE} ./build_gcc.sh 2>&1 | log "build.log"
       fi
 

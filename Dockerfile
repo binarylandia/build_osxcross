@@ -1,104 +1,121 @@
-ARG DOCKER_BASE_IMAGE
-FROM $DOCKER_BASE_IMAGE
-
-ARG DOCKER_BASE_IMAGE
-ENV DOCKER_BASE_IMAGE="${DOCKER_BASE_IMAGE}"
+# syntax=docker/dockerfile:1
+# check=experimental=all
+FROM debian:12.7
 
 SHELL ["bash", "-euxo", "pipefail", "-c"]
 
-RUN set -euxo pipefail >/dev/null \
-&& if [[ "$DOCKER_BASE_IMAGE" != centos* ]] && [[ "$DOCKER_BASE_IMAGE" != *manylinux2014* ]]; then exit 0; fi \
-&& sed -i "s/enabled=1/enabled=0/g" "/etc/yum/pluginconf.d/fastestmirror.conf" \
-&& sed -i "s/enabled=1/enabled=0/g" "/etc/yum/pluginconf.d/ovl.conf" \
-&& yum clean all >/dev/null \
-&& yum install -y epel-release >/dev/null \
-&& yum remove -y \
-  clang* \
-  devtoolset* \
-  gcc* \
-  llvm-toolset* \
->/dev/null \
-&& yum install -y \
-  bash \
-  ca-certificates \
-  curl \
-  git \
-  glibc-static \
-  make \
-  parallel \
-  sudo \
-  tar \
-  xz \
->/dev/null \
-&& yum clean all >/dev/null \
-&& rm -rf /var/cache/yum
-
+ENV HOST_GCC_TRIPLET="x86_64-unknown-linux-gnu"
+ENV HOST_TUPLE="x86_64-unknown-linux-gnu"
+ENV HOST_TUPLE_DEBIAN="x86_64-linux-gnu"
 
 RUN set -euxo pipefail >/dev/null \
-&& if [[ "$DOCKER_BASE_IMAGE" != debian* ]] && [[ "$DOCKER_BASE_IMAGE" != ubuntu* ]]; then exit 0; fi \
 && export DEBIAN_FRONTEND=noninteractive \
 && apt-get update -qq --yes \
 && apt-get install -qq --no-install-recommends --yes \
   bash \
+  bzip2 \
   ca-certificates \
-  clang \
   curl \
-  g++ \
-  gcc \
+  file \
   git \
   make \
   parallel \
+  patch \
+  pigz \
+  pixz \
+  pkg-config \
+  python3 \
   sudo \
   tar \
+  time \
+  unzip \
+  util-linux \
   xz-utils \
+  zstd \
 >/dev/null \
 && rm -rf /var/lib/apt/lists/* \
 && apt-get clean autoclean >/dev/null \
 && apt-get autoremove --yes >/dev/null
 
-RUN set -euxo pipefail >/dev/null \
-&& rm -rf "/opt/_internal/pipx"
+ENV PREFIX_HOST="/usr"
+ENV HOST_GCC_DIR="/opt/gcc"
 
-ENV CCACHE_DIR="/cache/ccache"
-ENV CCACHE_NOCOMPRESS="1"
-ENV CCACHE_MAXSIZE="50G"
-RUN set -euxo pipefail >/dev/null \
-&& curl -fsSL "https://github.com/ccache/ccache/releases/download/v4.10.2/ccache-4.10.2-linux-x86_64.tar.xz" | tar --strip-components=1 -C "/usr/bin" -xJ "ccache-4.10.2-linux-x86_64/ccache" \
-&& which ccache \
-&& ccache --version
+COPY --link "dev/docker/files/install-libbzip2" "/"
+RUN /install-libbzip2 "${HOST_TUPLE}" "${PREFIX_HOST}"
+
+COPY --link "dev/docker/files/install-liblzma" "/"
+RUN /install-liblzma "${HOST_TUPLE}" "${PREFIX_HOST}"
+
+COPY --link "dev/docker/files/install-libz" "/"
+RUN /install-libz "${HOST_TUPLE}" "${PREFIX_HOST}"
+
+COPY --link "dev/docker/files/install-libzstd" "/"
+RUN /install-libzstd "${HOST_TUPLE}" "${PREFIX_HOST}"
+
+COPY --link "dev/docker/files/install-libxml" "/"
+RUN /install-libxml "${HOST_TUPLE}" "${PREFIX_HOST}"
+
+COPY --link "dev/docker/files/install-openssl" "/"
+RUN /install-openssl "${HOST_TUPLE}" "${PREFIX_HOST}"
+
+COPY --link "dev/docker/files/install-ccache" "/"
+RUN /install-ccache "${PREFIX_HOST}"
+
+COPY --link "dev/docker/files/install-cmake" "/"
+RUN /install-cmake "${PREFIX_HOST}"
+
+COPY --link "dev/docker/files/install-llvm" "/"
+RUN /install-llvm "${PREFIX_HOST}"
+
+COPY --link "dev/docker/files/install-gcc-cross" "/"
+RUN /install-gcc-cross "${HOST_TUPLE}" "${HOST_GCC_DIR}"
+
+ENV PATH="${HOST_GCC_DIR}/bin:${PATH}"
+ENV C_INCLUDE_PATH="/usr/include:/usr/include/${HOST_TUPLE_DEBIAN}"
+ENV CPLUS_INCLUDE_PATH="${C_INCLUDE_PATH}"
+ENV LIBRARY_PATH="/usr/lib:/usr/lib64:/usr/lib/${HOST_TUPLE_DEBIAN}"
+
+ENV C_INCLUDE_PATH="${SYSROOT}/usr/include:${C_INCLUDE_PATH}"
+ENV CPLUS_INCLUDE_PATH="${C_INCLUDE_PATH}"
+ENV LIBRARY_PATH="${SYSROOT}/usr/lib:${LIBRARY_PATH}"
+
+ENV SYSROOT="${HOST_GCC_DIR}/${HOST_GCC_TRIPLET}/sysroot"
+
+ENV GCC="${HOST_GCC_DIR}/bin/${HOST_GCC_TRIPLET}-gcc"
+ENV GXX="${HOST_GCC_DIR}/bin/${HOST_GCC_TRIPLET}-g++"
+ENV GPP="${GXX}"
+ENV GFORTRAN="${HOST_GCC_DIR}/bin/${HOST_GCC_TRIPLET}-gfortran"
+ENV ADDR2LINE="${HOST_GCC_DIR}/bin/${HOST_GCC_TRIPLET}-addr2line"
+ENV AR="${HOST_GCC_DIR}/bin/${HOST_GCC_TRIPLET}-gcc-ar"
+ENV AS="${HOST_GCC_DIR}/bin/${HOST_GCC_TRIPLET}-as"
+ENV CPP="${HOST_GCC_DIR}/bin/${HOST_GCC_TRIPLET}-cpp"
+ENV CPPFILT="${HOST_GCC_DIR}/bin/${HOST_GCC_TRIPLET}-c++filt"
+ENV ELFEDIT="${HOST_GCC_DIR}/bin/${HOST_GCC_TRIPLET}-elfedit"
+ENV LD="${HOST_GCC_DIR}/bin/${HOST_GCC_TRIPLET}-ld"
+ENV LDD="${HOST_GCC_DIR}/bin/${HOST_GCC_TRIPLET}-ldd"
+ENV NM="${HOST_GCC_DIR}/bin/${HOST_GCC_TRIPLET}-gcc-nm"
+ENV OBJCOPY="${HOST_GCC_DIR}/bin/${HOST_GCC_TRIPLET}-objcopy"
+ENV OBJDUMP="${HOST_GCC_DIR}/bin/${HOST_GCC_TRIPLET}-objdump"
+ENV RANLIB="${HOST_GCC_DIR}/bin/${HOST_GCC_TRIPLET}-gcc-ranlib"
+ENV READELF="${HOST_GCC_DIR}/bin/${HOST_GCC_TRIPLET}-readelf"
+ENV SIZE="${HOST_GCC_DIR}/bin/${HOST_GCC_TRIPLET}-size"
+ENV STRINGS="${HOST_GCC_DIR}/bin/${HOST_GCC_TRIPLET}-strings"
+ENV STRIP="${HOST_GCC_DIR}/bin/${HOST_GCC_TRIPLET}-strip"
+
+ENV CLANG_FLAGS="--gcc-toolchain=${HOST_GCC_DIR} -static-libgcc -static-libstdc++ --sysroot=${SYSROOT} -fuse-ld=${LD}"
+ENV CLANG="${PREFIX_HOST}/bin/clang ${CLANG_FLAGS}"
+ENV CLANGXX="${PREFIX_HOST}/bin/clang++ ${CLANG_FLAGS}"
+ENV CLANGPP="${CLANGXX}"
+ENV FLANG="${PREFIX_HOST}/bin/flang ${CLANG_FLAGS}"
+
+ENV CC="${GCC}"
+ENV CXX="${GXX}"
+ENV FC="${GFORTRAN}"
 
 RUN set -euxo pipefail >/dev/null \
-&& curl -fsSL "https://github.com/Kitware/CMake/releases/download/v3.30.5/cmake-3.30.5-linux-x86_64.tar.gz" | tar --strip-components=1 -C "/usr" -xz \
-&& which cmake \
-&& cmake --version
+&& cd "${HOST_GCC_DIR}/bin" \
+&& ln -sf "${CPPFILT}" "c++filt"
 
-RUN set -euxo pipefail >/dev/null \
-&& curl -fsSL "https://github.com/binarylandia/build_zlib/releases/download/zlib-1.3.1-static-20241031112952/zlib-1.3.1-static-20241031112952.tar.xz" | tar -C "/usr" -xJ \
-&& ls /usr/include/zlib.h \
-&& ls /usr/lib/libz.a
-
-RUN set -euxo pipefail >/dev/null \
-&& curl -fsSL "https://github.com/binarylandia/build_libxml2/releases/download/libxml2-2.12.9-static-20241031113236/libxml2-2.12.9-static-20241031113236.tar.xz" | tar -C "/usr" -xJ \
-&& ls /usr/include/libxml/xmlwriter.h \
-&& ls /usr/lib/libxml2.a
-
-RUN set -euxo pipefail >/dev/null \
-&& curl -fsSL "https://github.com/binarylandia/build_openssl/releases/download/openssl-3.2.2-static-2024-10-31_12-20-48/openssl-3.2.2-static-2024-10-31_12-20-48.tar.xz" | tar -C "/usr" -xJ \
-&& ls /usr/include/openssl/evp.h \
-&& ls /usr/lib/libssl.a \
-&& ls /usr/lib/libcrypto.a
-
-RUN set -euxo pipefail >/dev/null \
-&& curl -fsSL "https://github.com/binarylandia/build_gcc/releases/download/2024-11-03_12-57-14/gcc-14.2.0-host-x86_64-unknown-linux-gnu.2.17-2024-11-03_12-57-14.tar.xz" | tar -C "/usr" -xJ \
-&& ls /usr/bin/gcc \
-&& gcc -v \
-&& ls /usr/bin/gcc-ar \
-&& gcc-ar --version
-
-RUN set -euxo pipefail >/dev/null \
-&& curl -fsSL "https://github.com/binarylandia/build_llvm/releases/download/llvm-19.1.3-2024-11-03_15-15-54/llvm-19.1.3-2024-11-03_15-15-54.tar.xz" | tar -C "/usr" -xJ \
-&& ls /usr/bin/clang \
-&& clang -v
 
 ARG USER=user
 ARG GROUP=user
@@ -112,16 +129,8 @@ ENV GID=$GID
 ENV TERM="xterm-256color"
 ENV HOME="/home/${USER}"
 
-COPY docker/files /
+COPY --link "dev/docker/files/create-user" "/"
+RUN /create-user
 
-RUN set -euxo pipefail >/dev/null \
-&& /create-user \
-&& sed -i /etc/sudoers -re 's/^%sudo.*/%sudo ALL=(ALL:ALL) NOPASSWD: ALL/g' \
-&& sed -i /etc/sudoers -re 's/^root.*/root ALL=(ALL:ALL) NOPASSWD: ALL/g' \
-&& sed -i /etc/sudoers -re 's/^#includedir.*/## **Removed the include directive** ##"/g' \
-&& echo "%sudo ALL=(ALL) NOPASSWD:ALL" >> /etc/sudoers \
-&& echo "${USER} ALL=(ALL) NOPASSWD:ALL" >> /etc/sudoers \
-&& touch ${HOME}/.hushlogin \
-&& chown -R ${UID}:${GID} "${HOME}"
 
 USER ${USER}
