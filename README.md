@@ -1,6 +1,4 @@
-# build_osxcross
-
-Prebuilt macOS cross-compilation toolchain for Linux.
+# Prebuilt macOS cross-compilation toolchain for Linux
 
 ## [Releases](https://github.com/binarylandia/build_osxcross/releases)
 
