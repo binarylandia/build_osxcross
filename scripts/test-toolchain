@@ -1,123 +1,121 @@
 #!/usr/bin/env bash
-
+#
+# Usage: scripts/test-toolchain <toolchain folder>
+#
+# Compile and link C, C++, and assembly for every architecture of an osxcross
+# toolchain, and fail unless each output is a Mach-O file of that architecture
+# with the deployment target of the toolchain. A C program that calls
+# __builtin_available also checks that compiler-rt links.
+#
 set -euo pipefail
 
-cat > input_lib.h << 'EOF'
-const char* get_input_string();
-void verify_string(const char* original, const char* decompressed);
-EOF
+function fail() {
+  printf 'ERROR: %s\n' "$*" >&2
+  exit 1
+}
 
-cat > input_lib.c << 'EOF'
+# Print the minimum macOS version of a Mach-O file (LC_BUILD_VERSION, or
+# LC_VERSION_MIN_MACOSX for old deployment targets).
+function minos() {
+  llvm-otool -l "${1}" | awk '
+    /cmd LC_BUILD_VERSION/ { build = 1 }
+    build && $1 == "minos" { print $2; exit }
+    /cmd LC_VERSION_MIN_MACOSX/ { vmin = 1 }
+    vmin && $1 == "version" { print $2; exit }
+  '
+}
+
+function check_binary() {
+  local file="${1}"
+  local arch="${2}"
+  local expected_minos="${3}"
+  local archs
+  archs="$(llvm-lipo -archs "${file}" | xargs)"
+  [[ "${archs}" == "${arch}" ]] || fail "${file} is built for '${archs}', not ${arch}"
+  local actual_minos
+  actual_minos="$(minos "${file}")"
+  [[ "${actual_minos}" == "${expected_minos}" ]] || fail "${file} targets macOS ${actual_minos}, not ${expected_minos}"
+}
+
+# Fail unless every Linux program of the toolchain runs with glibc 2.17 and
+# needs no shared C++ or GCC runtime.
+function check_host_programs() {
+  local toolchain="${1}"
+  local file
+  while IFS= read -r -d '' file; do
+    [[ "$(od -An -tx1 -N4 "${file}")" == ' 7f 45 4c 46' ]] || continue
+    if llvm-readelf --dynamic "${file}" | grep -E '\(NEEDED\).*\[(libstdc\+\+|libgcc_s|libc\+\+)'; then
+      fail "${file} needs a shared C++ or GCC runtime"
+    fi
+    local newest
+    newest="$(llvm-readelf --version-info "${file}" | grep -oE 'GLIBC_[0-9]+(\.[0-9]+)+' | sed 's/^GLIBC_//' | sort -V | tail -1)"
+    if [[ -n "${newest}" && "$(printf '%s\n2.17\n' "${newest}" | sort -V | tail -1)" != "2.17" ]]; then
+      fail "${file} needs glibc ${newest}, newer than 2.17"
+    fi
+  done < <(find "${toolchain}/bin" -type f -print0)
+}
+
+main() {
+  local toolchain="${1:?toolchain folder}"
+  check_host_programs "${toolchain}"
+  export PATH="${toolchain}/bin:${PATH}"
+  local target
+  target="$(osxcross-conf | sed -n 's/^export OSXCROSS_TARGET="\{0,1\}\([^"]*\)"\{0,1\}$/\1/p')"
+  local version_min
+  version_min="$(osxcross-conf | sed -n 's/^export OSXCROSS_OSX_VERSION_MIN="\{0,1\}\([^"]*\)"\{0,1\}$/\1/p')"
+  local archs
+  archs="$(osxcross-conf | sed -n 's/^export OSXCROSS_SUPPORTED_ARCHS="\{0,1\}\([^"]*\)"\{0,1\}$/\1/p')"
+  [[ -n "${target}" && -n "${version_min}" && -n "${archs}" ]] || fail "osxcross-conf does not name the target, deployment target, and architectures"
+
+  test_dir="$(mktemp -d)"
+  trap 'rm -rf -- "${test_dir}"' EXIT
+
+  cat >"${test_dir}/main.c" <<'EOF'
 #include <stdio.h>
-#include <string.h>
-
-const char* get_input_string() {
-    return "Hello, world!";
-}
-
-void verify_string(const char* original, const char* decompressed) {
-    if (strcmp(original, decompressed) == 0) {
-        printf("Verification successful: \"%s\"\n", decompressed);
-    } else {
-        printf("Verification failed.\n");
-    }
-}
-EOF
-
-cat > test.c << 'EOF'
-#include <stdio.h>
-#include <string.h>
-#include <assert.h>
-#include <zlib.h>
-#include "input_lib.h"
-
-#define BUFFER_SIZE 1024
-
-void compress_decompress(const char* input) {
-  uLong src_len = strlen(input) + 1; // Including null terminator
-  uLong comp_len = compressBound(src_len);
-  uLong decomp_len = src_len;
-
-  unsigned char comp_buf[BUFFER_SIZE];
-  unsigned char decomp_buf[BUFFER_SIZE];
-
-  // Compress the input
-  int comp_res = compress(comp_buf, &comp_len, (const unsigned char*)input, src_len);
-  assert(comp_res == Z_OK);
-
-  // Decompress the input
-  int decomp_res = uncompress(decomp_buf, &decomp_len, comp_buf, comp_len);
-  assert(decomp_res == Z_OK);
-
-  // Output results
-  printf("Original: %s\nCompressed: %lu bytes\nDecompressed: %s\n", input, comp_len, decomp_buf);
-  verify_string(input, (char*)decomp_buf);
-}
-
-int main() {
-  const char* test_string = get_input_string();
-  compress_decompress(test_string);
+int main(void) {
+  if (__builtin_available(macOS 10.15, *)) {
+    puts("10.15 or later");
+  }
   return 0;
 }
 EOF
-
-# Create Makefile
-cat > Makefile << 'EOF'
-CC ?= gcc
-LD ?= ld
-AR ?= ar
-CFLAGS ?= -Wall -Wextra -O2
-CFLAGS += $(shell pkg-config --cflags zlib)
-LDFLAGS ?=
-LDFLAGS += -L. -linput $(shell pkg-config --libs zlib)
-
-TARGET = test_program
-LIB = libinput.a
-SRC = test.c
-LIB_SRC = input_lib.c
-OBJ = $(SRC:.c=.o)
-LIB_OBJ = $(LIB_SRC:.c=.o)
-
-.PHONY: all clean run
-
-all: $(TARGET)
-
-$(LIB): $(LIB_OBJ)
-	$(AR) rcs $@ $^
-
-$(TARGET): $(OBJ) $(LIB)
-	$(CC) -o $@ $^ $(LDFLAGS)
-
-%.o: %.c
-	$(CC) $(CFLAGS) -c $< -o $@
-
-clean:
-	rm -f $(TARGET) $(OBJ) $(LIB) $(LIB_OBJ)
-
-run: $(TARGET)
-	./$(TARGET)
-
+  cat >"${test_dir}/main.cpp" <<'EOF'
+#include <iostream>
+#include <stdexcept>
+#include <vector>
+int main() {
+  std::vector<int> v{1, 2, 3};
+  try {
+    throw std::runtime_error("expected");
+  } catch (const std::exception &e) {
+    std::cout << e.what() << v.size() << "\n";
+  }
+  return 0;
+}
+EOF
+  cat >"${test_dir}/add.s" <<'EOF'
+.text
+.globl _add
+_add:
 EOF
 
-make
+  local arch
+  for arch in ${archs}; do
+    local expected_minos="${version_min}"
+    if [[ "${arch}" == arm64* ]] && [[ "$(printf '%s\n11.0\n' "${version_min}" | sort -V | head -1)" != "11.0" ]]; then
+      expected_minos="11.0"
+    fi
+    local cc="${arch}-apple-${target}-clang"
+    local cxx="${arch}-apple-${target}-clang++"
+    "${cc}" -O2 "${test_dir}/main.c" "${toolchain}/compiler-rt/lib/darwin/libclang_rt.osx.a" -o "${test_dir}/c-${arch}"
+    check_binary "${test_dir}/c-${arch}" "${arch}" "${expected_minos}"
+    "${cxx}" -O2 -stdlib=libc++ "${test_dir}/main.cpp" -o "${test_dir}/cxx-${arch}"
+    check_binary "${test_dir}/cxx-${arch}" "${arch}" "${expected_minos}"
+    "${cc}" -c "${test_dir}/add.s" -o "${test_dir}/add-${arch}.o"
+    "${arch}-apple-${target}-ar" rcs "${test_dir}/libadd-${arch}.a" "${test_dir}/add-${arch}.o"
+    "${arch}-apple-${target}-nm" "${test_dir}/libadd-${arch}.a" | grep -q ' T _add' || fail "ar or nm of ${arch} lost the symbol _add"
+    printf 'ok %s-apple-%s, macOS %s\n' "${arch}" "${target}" "${expected_minos}"
+  done
+}
 
-output=$(./test_program)
-status=$?
-
-expected_output="Original: Hello, world!
-Compressed: 22 bytes
-Decompressed: Hello, world!
-Verification successful: \"Hello, world!\""
-
-if [[ $status -ne 0 ]]; then
-    echo "Test failed: Unexpected error with exit status $status" >&2
-    exit 1
-elif [[ "$output" != "$expected_output" ]]; then
-    echo "Test failed: Output does not match expected" >&2
-    printf "%q\n" "Expected: $expected_output" >&2
-    printf "%q\n" "Received: $output" >&2
-    exit 1
-fi
-
-make -s clean
-rm -f Makefile test.c input_lib.h input_lib.c
+main "$@"

@@ -1,5 +1,14 @@
 #!/usr/bin/env bash
-
+#
+# Usage: $0 [command]
+#
+# Build the builder image and run a command in it, by default scripts/main.
+# The macOS SDK comes from .env (see .env.example).
+#
+# Examples:
+#   $0
+#   $0 bash
+#
 set -euxo pipefail
 
 export BUILDKIT_PROGRESS=plain
@@ -9,29 +18,59 @@ DOCKER_REPO="osxcross_builder"
 DOCKER_IMAGE_NAME_SAFE="${DOCKER_REPO//\//-}"
 DOCKER_CONTAINER_NAME="${DOCKER_IMAGE_NAME_SAFE}-$(date -u "+%Y-%m-%d_%H-%M-%S_%3NZ")"
 
+# Debian 12 by digest, so every build starts from the same image.
+DOCKER_BASE_IMAGE="debian:12.14-slim@sha256:60eac759739651111db372c07be67863818726f754804b8707c90979bda511df"
+
+# The LLVM release that the toolchain runs, recorded in the metadata of each
+# archive. Consumers install the same release.
+LLVM_RELEASE="llvm-22.1.8-2026-10-18_08-49-56"
+LLVM_SHA256="33e95123609efdcbdb4627ea07e9b7dd75ab8ebf491cdfe5bf994e3f20a2c14d"
+
+# The commit that the build runs, recorded in the metadata of each archive.
+# scripts/release publishes only archives of a clean, pushed commit.
+BUILD_COMMIT="$(git rev-parse HEAD)"
+BUILD_DIRTY="false"
+if [[ -n "$(git status --porcelain --untracked-files=no)" ]]; then
+  BUILD_DIRTY="true"
+fi
+# The time of the commit, used as the time of every archive entry.
+SOURCE_DATE_EPOCH="$(git log -1 --format=%ct)"
+BUILD_TIME="${BUILD_TIME:-$(date -u "+%Y-%m-%d_%H-%M-%S")}"
+
 USER="user"
 GROUP="user"
 
 docker build \
   --tag="${DOCKER_IMAGE_NAME_SAFE}" \
   --network=host \
+  --build-arg="DOCKER_BASE_IMAGE=${DOCKER_BASE_IMAGE}" \
+  --build-arg="LLVM_RELEASE=${LLVM_RELEASE}" \
+  --build-arg="LLVM_SHA256=${LLVM_SHA256}" \
   --build-arg="UID=$(id -u)" \
   --build-arg="GID=$(id -g)" \
   --build-arg="USER=${USER}" \
   --build-arg="GROUP=${GROUP}" \
   .
 
-mkdir -p .build .cache/ccache .opt .out
+mkdir -p .build .opt .out
 
-docker run -it --rm \
+tty_flags=()
+if tty -s; then
+  tty_flags=(--interactive --tty)
+fi
+
+env_file=()
+if [[ -f .env ]]; then
+  env_file=(--env-file=".env")
+fi
+
+docker run --rm "${tty_flags[@]}" \
   --init \
   --name="${DOCKER_CONTAINER_NAME}" \
   --hostname="${DOCKER_IMAGE_NAME_SAFE}" \
-  --add-host="${DOCKER_IMAGE_NAME_SAFE}:127.0.1.1" \
   --user="$(id -u):$(id -g)" \
   --volume="$(pwd):/workdir" \
   --volume="$(pwd)/.opt:/opt/osxcross" \
-  --volume="$(pwd)/.cache/ccache:/cache/ccache" \
   --workdir="/workdir" \
   --env="UID=$(id -u)" \
   --env="GID=$(id -g)" \
@@ -40,7 +79,11 @@ docker run -it --rm \
   --env="PS1=\${USER}@\${HOST}" \
   --env="TZ=Etc/UTC" \
   --env="LANG=C.UTF-8" \
-  --env-file=".env" \
+  --env="BUILD_COMMIT=${BUILD_COMMIT}" \
+  --env="BUILD_DIRTY=${BUILD_DIRTY}" \
+  --env="SOURCE_DATE_EPOCH=${SOURCE_DATE_EPOCH}" \
+  --env="BUILD_TIME=${BUILD_TIME}" \
+  "${env_file[@]}" \
   --ulimit core=0 \
-  "$DOCKER_IMAGE_NAME_SAFE" \
-  bash -c "${@:-./scripts/main}"
+  "${DOCKER_IMAGE_NAME_SAFE}" \
+  bash -c "${*:-./scripts/main}"

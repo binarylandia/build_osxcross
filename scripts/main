@@ -1,149 +1,212 @@
 #!/usr/bin/env bash
+#
+# Usage: scripts/main
+#
+# Build the macOS cross toolchain inside the builder container (./build) and
+# package it as .out/<build time>/osxcross-<osxcross commit>-<build time>: the
+# osxcross llvm flavor (compiler wrappers and tool links for clang, ld64.lld,
+# and the LLVM Darwin tools of the image), cctools lipo, compiler-rt for macOS,
+# the CMake toolchain files, and the macOS SDK. A JSON file next to the archives
+# holds the metadata that scripts/release puts into the release manifest.
+#
+# Environment:
+#   MACOS_SDK_PATH    SDK tarball made by tools/gen_sdk_package.sh of osxcross
+#   MACOS_SDK_SHA256  sha256 of the SDK tarball
+#   OSX_VERSION_MIN   x86_64 deployment target (default: 10.12 for SDKs older
+#                     than 14, else 10.13, the oldest that Xcode 14 and later
+#                     support); arm64 always targets 11.0 or later
+#   JOBS              build parallelism (default: CPU count + 2)
+#
+set -euxo pipefail
 
-set -euo pipefail
-
-: "${MACOS_SDK_URL:? "$0: \$MACOS_SDK_URL is not set"}"
-: "${MACOS_SDK_PATH:? "$0: \$MACOS_SDK_PATH is not set"}"
-
-export BUILD_DIR=".build"
-export OUT_DIR=".out"
-
-export CFLAGS="-w -g0 -Os ${CFLAGS:-}"
-export CXXFLAGS="-w -g0 -Os ${CXXFLAGS:-}"
-export LDFLAGS="-w -s ${LDFLAGS:-}"
-
-export CFLAGS="-static-libgcc -static-libstdc++ ${CFLAGS:-}"
-export CXXFLAGS="-static-libgcc -static-libstdc++ ${CXXFLAGS:-}"
-export LDFLAGS="-static-libgcc -static-libstdc++ ${LDFLAGS:-}"
+# osxcross, upstream main of 2026-07-24
+OSXCROSS_URL="https://github.com/tpoechtrager/osxcross"
+OSXCROSS_COMMIT="27d21e4977c9751d01199c7a226a6faf494c3dd9"
+# cctools-port branch lipo-1010.6, which the llvm flavor builds for lipo
+CCTOOLS_URL="https://github.com/tpoechtrager/cctools-port"
+CCTOOLS_COMMIT="b64c1f9d649adbc9e4dfbec22731de869458e6b9"
 
 export NICE="nice -19 ionice -c2 -n5"
-export JOBS="${JOBS:=$(($(nproc --all) + 2))}"
+export JOBS="${JOBS:-$(($(nproc --all) + 2))}"
+export build_time="${BUILD_TIME:-$(date -u '+%Y-%m-%d_%H-%M-%S')}"
 
-export build_time="$(date -u '+%Y-%m-%d_%H-%M-%S')"
+THIS_DIR="$(dirname "$(realpath "${BASH_SOURCE[0]}")")"
+ROOT_DIR="$(realpath "${THIS_DIR}/..")"
+BUILD_DIR="${ROOT_DIR}/.build"
+OUT_DIR="${ROOT_DIR}/.out/${build_time}"
+INSTALL_DIR="/opt/osxcross/toolchain"
 
-function abspath() {
-  readlink -m "$1"
-}
-export -f abspath
-
-function log() {
-  tee -a "${1}" |
-    GREP_COLOR='01;31' stdbuf -oL grep --color=always -iE "err|error|fail|can not|cannot|can't|unable|exception|critical|fatal|reject|deny|denied|terminat|abort|panic|fault|" |
-    GREP_COLOR='01;33' stdbuf -oL grep --color=always -iE "warn|warning|caution|alert|notice|" |
-    GREP_COLOR='01;36' stdbuf -oL grep --color=always -iE "note|info|status|detail|"
-}
-export -f log
-
-function package() {
+# Write the files of a directory as a tar stream to stdout. The entries are
+# sorted, owned by root, and carry the time SOURCE_DATE_EPOCH, so the same files
+# always give the same archive. Each path is listed once; tar does not recurse.
+function tar_dir() {
   local input_dir="${1}"
-  local output_tarball="${2}"
-
-  ${NICE} find "${input_dir}" -printf "%P\n" |
-    ${NICE} tar --no-recursion -cf - -C "${input_dir}" --files-from=- |
-    ${NICE} xz -T0 -k >"${output_tarball}"
+  find "${input_dir}" -mindepth 1 -printf '%P\n' | LC_ALL=C sort |
+    tar --posix --no-recursion --mtime="@${SOURCE_DATE_EPOCH:?}" --owner=0 --group=0 --numeric-owner \
+      --pax-option=exthdr.name=%d/PaxHeaders/%f,delete=atime,delete=ctime \
+      -cf - -C "${input_dir}" --files-from=-
 }
-export -f package
+export -f tar_dir
 
-export THIS_DIR="$(abspath "$(cd "$(dirname "${BASH_SOURCE[0]}")"; pwd)")"
-export ROOT_DIR="$(abspath "${THIS_DIR}/..")"
+# The compressors give the same output for the same input with any number of
+# threads: xz in its multi-threaded mode, pigz without the file name and time,
+# and zstd always.
+function package_all() {
+  local input_dir="${1}"
+  local output_basename="${2}"
+  local threads
+  threads="$(($(nproc) > 1 ? $(nproc) : 2))"
+  mkdir -p "$(dirname "${output_basename}")"
+  ${NICE} bash -c "tar_dir '${input_dir}' | xz -T ${threads} -5 >'${output_basename}.tar.xz'"
+  ${NICE} bash -c "tar_dir '${input_dir}' | pigz -n -p ${threads} -7 >'${output_basename}.tar.gz'"
+  ${NICE} bash -c "tar_dir '${input_dir}' | zstd -q -T${threads} -7 >'${output_basename}.tar.zst'"
+}
 
-export MACOS_SDK_PATH="$(abspath "${MACOS_SDK_PATH}")"
-if [ ! -f "${MACOS_SDK_PATH}" ]; then
-  mkdir -p "$(dirname "${MACOS_SDK_PATH}")"
-  curl -fsSL -o "${MACOS_SDK_PATH}" "${MACOS_SDK_URL}"
-fi
+# Check out one commit of a repository into a folder, without its history.
+function fetch_commit() {
+  local url="${1}"
+  local commit="${2}"
+  local dir="${3}"
+  rm -rf "${dir}"
+  git init -q "${dir}"
+  git -C "${dir}" fetch -q --depth=1 "${url}" "${commit}"
+  git -C "${dir}" -c advice.detachedHead=false checkout -q FETCH_HEAD
+  if [[ "$(git -C "${dir}" rev-parse HEAD)" != "${commit}" ]]; then
+    printf 'ERROR: %s checked out %s, not %s\n' "${url}" "$(git -C "${dir}" rev-parse HEAD)" "${commit}" >&2
+    return 1
+  fi
+}
 
-export CCACHE_DIR="${ROOT_DIR}/.cache/ccache"
-export CCACHE_NOCOMPRESS="1"
-export CCACHE_MAXSIZE="50G"
+function check_sdk() {
+  : "${MACOS_SDK_PATH:?set MACOS_SDK_PATH to the SDK tarball (see .env.example)}"
+  : "${MACOS_SDK_SHA256:?set MACOS_SDK_SHA256 to the sha256 of the SDK tarball}"
+  local actual
+  actual="$(sha256sum "${MACOS_SDK_PATH}" | cut -d' ' -f1)"
+  if [[ "${actual}" != "${MACOS_SDK_SHA256}" ]]; then
+    printf 'ERROR: %s has sha256 %s, not %s\n' "${MACOS_SDK_PATH}" "${actual}" "${MACOS_SDK_SHA256}" >&2
+    return 1
+  fi
+}
 
-export CMAKE_C_COMPILER_LAUNCHER="ccache"
-export CMAKE_CXX_COMPILER_LAUNCHER="ccache"
+# The source of compiler-rt for the clang of the image, from the LLVM release
+# with the same version.
+function fetch_compiler_rt() {
+  local dir="${1}"
+  local llvm_version="${2}"
+  local name="llvm-project-${llvm_version}.src.tar.xz"
+  local sha256
+  sha256="$(awk -v name="${name}" '$2 == name {print $1}' "${THIS_DIR}/sources.sha256")"
+  if [[ ! "${sha256}" =~ ^[a-f0-9]{64}$ ]]; then
+    printf 'ERROR: scripts/sources.sha256 has no checksum of %s\n' "${name}" >&2
+    return 1
+  fi
+  local archive="${BUILD_DIR}/tarballs/${name}"
+  mkdir -p "${BUILD_DIR}/tarballs"
+  if [[ ! -f "${archive}" ]]; then
+    /fetch "https://github.com/llvm/llvm-project/releases/download/llvmorg-${llvm_version}/${name}" "${sha256}" "${archive}"
+  fi
+  printf '%s  %s\n' "${sha256}" "${archive}" | sha256sum --check --quiet
+  rm -rf "${dir}"
+  mkdir -p "${dir}"
+  tar -C "${dir}" --strip-components=1 -xJf "${archive}"
+}
 
-flavors=(
-  "full"
-)
+function osxcross_conf() {
+  local name="${1}"
+  "${INSTALL_DIR}/bin/osxcross-conf" | sed -n "s/^export ${name}=\"\{0,1\}\([^\"]*\)\"\{0,1\}$/\1/p"
+}
 
-function build_and_package() {
-  set -euxo pipefail
+function write_metadata() {
+  local output_basename="${1}"
+  local llvm_version="${2}"
+  local name="${output_basename##*/}"
+  jq -n \
+    --arg name "${name}" \
+    --arg osxcross "${OSXCROSS_COMMIT}" \
+    --arg flavor "llvm" \
+    --arg cctools_lipo "${CCTOOLS_COMMIT}" \
+    --arg llvm "${llvm_version}" \
+    --arg llvm_release "${LLVM_RELEASE:?}" \
+    --arg sdk_version "$(osxcross_conf OSXCROSS_SDK_VERSION)" \
+    --arg sdk_sha256 "${MACOS_SDK_SHA256}" \
+    --arg darwin_target "$(osxcross_conf OSXCROSS_TARGET)" \
+    --arg deployment_target "$(osxcross_conf OSXCROSS_OSX_VERSION_MIN)" \
+    --arg archs "$(osxcross_conf OSXCROSS_SUPPORTED_ARCHS)" \
+    --arg base_image "${DOCKER_BASE_IMAGE:?}" \
+    --arg build_commit "${BUILD_COMMIT:?}" \
+    --argjson build_dirty "${BUILD_DIRTY:?}" \
+    --arg build_time "${build_time}" \
+    '{name: $name, osxcross: $osxcross, flavor: $flavor, cctools_lipo: $cctools_lipo,
+      llvm: $llvm, llvm_release: $llvm_release, sdk_version: $sdk_version, sdk_sha256: $sdk_sha256,
+      darwin_target: $darwin_target, deployment_target: $deployment_target, archs: ($archs | split(" ")),
+      base_image: $base_image, build_commit: $build_commit, build_dirty: $build_dirty, build_time: $build_time,
+      files: [($name + ".tar.xz"), ($name + ".tar.gz"), ($name + ".tar.zst")]}' \
+    >"${output_basename}.json"
+}
 
-  local flavor="${1}"
+function main() {
+  check_sdk
 
-  case "${flavor}" in
-  full)
-    local GIT_REPO_URL="https://github.com/binarylandia/osxcross"
-    local COMMIT_HASH="41f3856bae6e62bc44a2141c7977c63f87167809"
-    ;;
-  minimal)
-    local GIT_REPO_URL="https://github.com/binarylandia/osxcross"
-    local COMMIT_HASH="29fe6dd35522073c9df5800f8cd1feb4b9a993a8"
-    ;;
-  esac
+  local llvm_version
+  llvm_version="$(clang -dumpversion)"
+  local src_dir="${BUILD_DIR}/osxcross"
+  local dev_dir="${BUILD_DIR}/sources"
+  mkdir -p "${BUILD_DIR}" "${OUT_DIR}" "${dev_dir}"
 
-  local commit_short="${COMMIT_HASH:0:7}"
+  fetch_commit "${OSXCROSS_URL}" "${OSXCROSS_COMMIT}" "${src_dir}"
+  fetch_commit "${CCTOOLS_URL}" "${CCTOOLS_COMMIT}" "${dev_dir}/cctools-port"
+  fetch_compiler_rt "${dev_dir}/compiler-rt" "${llvm_version}"
+  cp "${MACOS_SDK_PATH}" "${src_dir}/tarballs/"
 
-  local build_dir="$(abspath ${BUILD_DIR})/${flavor}-${commit_short}"
-  local outdir="$(abspath "${OUT_DIR}")"
-  local install_dir="/opt/osxcross/${flavor}-${commit_short}"
-  local src_dir="osxcross-${flavor}-${commit_short}"
-  mkdir -p "${outdir}" "${build_dir}"
-
-  pushd "${build_dir}" >/dev/null
-  {
-    if [ ! -d "${src_dir}" ]; then
-      git clone --recursive --depth=1 "${GIT_REPO_URL}" "${src_dir}"
+  local sdk_version
+  sdk_version="$(basename "${MACOS_SDK_PATH}")"
+  sdk_version="${sdk_version#MacOSX}"
+  sdk_version="${sdk_version%.sdk.tar.*}"
+  local osx_version_min="${OSX_VERSION_MIN:-}"
+  if [[ -z "${osx_version_min}" ]]; then
+    if ((${sdk_version%%.*} < 14)); then
+      osx_version_min="10.12"
+    else
+      osx_version_min="10.13"
     fi
+  fi
 
-    if [ ! -f "${src_dir}/tarballs/$(basename "${MACOS_SDK_PATH}")" ]; then
-      cp "${MACOS_SDK_PATH}" "${src_dir}/tarballs/"
-    fi
-
-    pushd "${src_dir}" >/dev/null
-    {
-      git config advice.detachedHead false
-      git checkout "${COMMIT_HASH}"
-
-      declare -x OSX_VERSION_MIN="10.12"
-      declare -x MACOSX_DEPLOYMENT_TARGET="${OSX_VERSION_MIN}"
-      declare -x LIBZ_SYS_STATIC="1"
-      declare -x OSXCROSS_MP_INC="1"
-      declare -x GCC_VERSION="14.2.0"
-      declare -x ENABLE_FORTRAN="1"
-      declare -x ENABLE_COMPILER_RT_INSTALL="1"
-      declare -x PORTABLE=1
-      declare -x OCDEBUG=0
-      declare -x UNATTENDED=1
-      declare -x TARGET_DIR="${install_dir}"
-      declare -x INSTALLPREFIX="${install_dir}"
-
-      export PATH="${install_dir}/bin${PATH:+":$PATH"}"
-
-      export CC="ccache ${CLANG} ${CFLAGS}"
-      export CXX="ccache ${CLANGXX} ${CXXFLAGS}"
-      ${NICE} ./build.sh 2>&1 | log "build.log"
-
-      if [ "${flavor}" == "full" ]; then
-        export CC="ccache ${GCC} ${CFLAGS}"
-        export CXX="ccache ${GXX} ${CXXFLAGS}"
-        MY_TARGET_ARCH="x86_64"  ${NICE} ./build_gcc.sh 2>&1 | log "build.log"
-        MY_TARGET_ARCH="aarch64" ${NICE} ./build_gcc.sh 2>&1 | log "build.log"
-      fi
-
-      pushd "${install_dir}/bin" >/dev/null
-      {
-        ln -fs "dsymutil" "aarch64-apple-darwin20.2-dsymutil"
-        ln -fs "dsymutil" "arm64-apple-darwin20.2-dsymutil"
-        ln -fs "dsymutil" "arm64e-apple-darwin20.2-dsymutil"
-        ln -fs "dsymutil" "x86_64-apple-darwin20.2-dsymutil"
-        ln -fs "dsymutil" "x86_64h-apple-darwin20.2-dsymutil"
-      }
-      popd >/dev/null
-    }
-    popd >/dev/null
-  }
+  rm -rf "${INSTALL_DIR}"
+  pushd "${src_dir}" >/dev/null
+  # Every source comes from the checkouts above: osxcross copies the folders
+  # of TP_OSXCROSS_DEV instead of cloning branches.
+  (
+    export TP_OSXCROSS_DEV="${dev_dir}"
+    export BUILD_FLAVOR="llvm"
+    export UNATTENDED=1
+    export ENABLE_REPLACEMENT_LIPO=1
+    export ENABLE_ARCHS="arm64 x86_64"
+    export SDK_VERSION="${sdk_version}"
+    export OSX_VERSION_MIN="${osx_version_min}"
+    export TARGET_DIR="${INSTALL_DIR}"
+    export CC="clang ${HOST_CFLAGS:?}"
+    export CXX="clang++ ${HOST_CFLAGS:?}"
+    export LDFLAGS="${HOST_LDFLAGS:?}"
+    ${NICE} ./build.sh
+  )
+  (
+    export TP_OSXCROSS_DEV="${dev_dir}"
+    export PATH="${INSTALL_DIR}/bin:${PATH}"
+    unset ENABLE_COMPILER_RT_INSTALL
+    ${NICE} ./build_compiler_rt.sh
+  )
+  # compiler-rt in the layout of the clang resource folder, into which
+  # consumers copy it.
+  mkdir -p "${INSTALL_DIR}/compiler-rt/lib/darwin" "${INSTALL_DIR}/compiler-rt/include"
+  cp -a build/compiler-rt/compiler-rt/build/lib/darwin/. "${INSTALL_DIR}/compiler-rt/lib/darwin/"
+  cp -a build/compiler-rt/compiler-rt/include/sanitizer "${INSTALL_DIR}/compiler-rt/include/"
   popd >/dev/null
 
-  package "${install_dir}" "${outdir}/osxcross-${flavor}-${commit_short}-${build_time}.tar.xz"
+  "${THIS_DIR}/test-toolchain" "${INSTALL_DIR}"
+
+  local name="osxcross-${OSXCROSS_COMMIT:0:7}-${build_time}"
+  write_metadata "${OUT_DIR}/${name}" "${llvm_version}"
+  package_all "${INSTALL_DIR}" "${OUT_DIR}/${name}"
 }
-export -f build_and_package
-parallel -j5 -u build_and_package ::: "${flavors[@]}"
+
+main "$@"
